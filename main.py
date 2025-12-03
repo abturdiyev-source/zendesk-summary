@@ -128,7 +128,7 @@ def summarize_with_gemini(dialogue: str) -> str:
 2) Что сделал оператор.
 3) Текущий результат/статус.
 
-Максимум 3–4 предложения. Отвечай по-русски.
+Максимум 1–2 предложения. Отвечай по русски.
 """
 
     response = gemini_client.models.generate_content(

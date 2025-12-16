@@ -6,198 +6,360 @@ import secrets
 import os
 import requests
 import json
-import redis  # <--- Новая библиотека
+import redis
+from datetime import datetime
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+# 1. Загружаем настройки
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="Zendesk Auto-QA Service")
 
+# 2. Настраиваем CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],
+    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
     allow_origin_regex=r"https://(.+\.zendesk\.com|.+\.apps\.zdusercontent\.com)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 security = HTTPBasic()
 
-# -------- Basic Auth --------
-API_USERNAME = os.getenv("BASIC_AUTH_LOGIN", "admin")
-API_PASSWORD = os.getenv("BASIC_AUTH_PASSWORD", "secret_password")
+# --- ПРОВЕРКА ENV ---
+REQUIRED_VARS = ["ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN", "GEMINI_API_KEY"]
+missing = [v for v in REQUIRED_VARS if not os.getenv(v)]
+if missing:
+    print(f"⚠️  FATAL: В .env не хватает ключей: {', '.join(missing)}")
 
-def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    is_correct_username = secrets.compare_digest(credentials.username, API_USERNAME)
-    is_correct_password = secrets.compare_digest(credentials.password, API_PASSWORD)
-    if not (is_correct_username and is_correct_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Неверный логин или пароль",
-            headers={"WWW-Authenticate": "Basic"},
+# --- КОНФИГУРАЦИЯ ---
+API_USER = os.getenv("BASIC_AUTH_LOGIN", "admin")
+API_PASS = os.getenv("BASIC_AUTH_PASSWORD", "secret")
+
+ZD_URL = f"https://{os.getenv('ZENDESK_SUBDOMAIN')}.zendesk.com"
+ZD_AUTH = (f"{os.getenv('ZENDESK_EMAIL')}/token", os.getenv('ZENDESK_API_TOKEN'))
+
+# ИИ
+gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+GEMINI_MODEL_SUMMARY = "gemini-2.0-flash" # Быстрая для саммари
+GEMINI_MODEL_QA = "gemini-2.5-flash"      # Умная для оценки
+
+# Redis
+REDIS_URL = os.getenv("REDIS_URL")
+try:
+    if REDIS_URL:
+        r = redis.from_url(REDIS_URL, decode_responses=True)
+    else:
+        r = redis.Redis(
+            host=os.getenv("REDIS_HOST", "localhost"),
+            port=int(os.getenv("REDIS_PORT", 6379)),
+            db=0, decode_responses=True
         )
-    return credentials.username
+    r.ping()
+    print("✅ Redis подключен")
+except Exception as e:
+    print(f"⚠️ Redis недоступен: {e}. Работаем без кеша.")
+    r = None
 
-# -------- Настройки API --------
-ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN")
-ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
-ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
-ZENDESK_BASE_URL = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = "gemini-2.0-flash" 
-
-# -------- REDIS ПОДКЛЮЧЕНИЕ --------
-# Обычно хост 'localhost', порт 6379, db 0
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-
-# Создаем клиент
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
-
-# -------- Функции для Redis --------
-
-def get_summary_from_redis(ticket_id: str):
-    """Ищет ключ 'ticket:12345'."""
-    key = f"ticket:{ticket_id}"
-    data_json = r.get(key)
-    
-    if data_json:
-        # Redis возвращает строку, превращаем её обратно в словарь
-        return json.loads(data_json)
-    return None
-
-def save_summary_to_redis(ticket_id: str, data: dict):
-    """
-    Сохраняет саммари. 
-    Мы добавляем поле created_at сами перед сохранением.
-    """
-    key = f"ticket:{ticket_id}"
-    
-    # Добавим таймстемп, чтобы знать когда создали
-    data["created_at"] = str(os.getenv("Time_Now", "Just now")) 
-    
-    # Превращаем словарь в строку JSON
-    data_str = json.dumps(data, ensure_ascii=False)
-    
-    r.set(key, data_str)
-    # Если нужно, чтобы кеш протухал через неделю (604800 сек), раскомментируй:
-    # r.expire(key, 604800) 
-
-# -------- Модели --------
+# --- МОДЕЛИ ДАННЫХ ---
 class TicketRequest(BaseModel):
     ticket_id: str
+    class Config:
+        json_schema_extra = {"example": {"ticket_id": "21579460"}}
 
-class SummaryStructure(BaseModel):
+# Модель 1: Саммари
+class TicketSummary(BaseModel):
+    ticket_id: str
+    assignee_id: int | str | None = None
+    agent_name: str | None = "Unknown"
+    
     issue: str
     action: str
     result: str
+    
+    status: str | None = None
 
-# -------- Логика Zendesk (стандартная) --------
-def get_zendesk_audits(ticket_id: str) -> dict:
-    url = f"{ZENDESK_BASE_URL}/api/v2/tickets/{ticket_id}/audits.json"
-    auth = (f"{ZENDESK_EMAIL}/token", ZENDESK_API_TOKEN)
-    resp = requests.get(url, auth=auth, timeout=15)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Zendesk error: {resp.status_code}")
-    return resp.json()
-
-def extract_dialogue_from_audits(audits_json: dict) -> str:
-    audits = audits_json.get("audits", [])
-    messages = []
-    for audit in audits:
-        events = audit.get("events", [])
-        for ev in events:
-            if ev.get("type") == "ChatStartedEvent":
-                history = ev.get("value", {}).get("history", [])
-                for h in history:
-                    if h.get("type") != "ChatMessage": continue
-                    actor = h.get("actor_type")
-                    text = h.get("message", "").strip()
-                    if not text: continue
-                    prefix = "CLIENT" if actor == "end-user" else "AGENT" if actor == "agent" else None
-                    if prefix: messages.append(f"{prefix}: {text}")
-    if not messages:
-        for audit in audits:
-            for ev in audit.get("events", []):
-                if ev.get("type") == "Comment" and ev.get("public") and ev.get("plain_body"):
-                    messages.append(f"MSG: {ev['plain_body']}")
-    return "\n".join(messages)
-
-# -------- Логика AI --------
-def summarize_with_gemini(dialogue: str) -> dict:
-    if not dialogue.strip():
-        return {"issue": "Нет данных", "action": "-", "result": "-"}
-    prompt = f"""
-    Ты — аналитик техподдержки. Проанализируй диалог: {dialogue}
-    Выведи JSON: "issue", "action", "result" (по 1 предложению).
-    """
-    try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=SummaryStructure
-            )
-        )
-        return json.loads(response.text)
-    except Exception as e:
-        print(f"AI Error: {e}")
-        return {"issue": "Ошибка", "action": "Ошибка", "result": str(e)}
-
-# ========== РУЧКИ ==========
-
-@app.post("/summary")
-def summarize_ticket(request: TicketRequest, username: str = Depends(check_auth)):
-    ticket_id = request.ticket_id
-
-    # 1. Сначала Redis
-    cached = get_summary_from_redis(ticket_id)
-    if cached:
-        print(f"REDIS Hit for {ticket_id}")
-        return {
-            "ticket_id": ticket_id,
-            "structured_summary": cached,
-            "status": "from_redis"
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "ticket_id": "21579460",
+                "assignee_id": 12345,
+                "agent_name": "Иван Иванов",
+                "issue": "Клиент не мог войти",
+                "action": "Сбросил пароль",
+                "result": "Успех",
+                "status": "generated_new"
+            }
         }
 
-    # 2. Если нет - работаем
-    audits = get_zendesk_audits(ticket_id)
-    dialogue = extract_dialogue_from_audits(audits)
+# Модель 2: Оценка (QA)
+class TicketEvaluation(BaseModel):
+    ticket_id: str
+    assignee_id: int | str | None = None
+    agent_name: str | None = "Unknown"
     
-    if not dialogue:
-        return {"ticket_id": ticket_id, "error": "Empty dialogue", "status": "failed"}
+    language: str
+    tov_score: int
+    solution_score: int
+    errors: list[str]
+    next_action: str
+    
+    analyzed_at: str | None = None
+    status: str | None = None
 
-    structured_data = summarize_with_gemini(dialogue)
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "ticket_id": "21579460",
+                "assignee_id": 12345,
+                "agent_name": "Иван Иванов",
+                "language": "ru",
+                "tov_score": 5,
+                "solution_score": 5,
+                "errors": [],
+                "next_action": "Молодец",
+                "analyzed_at": "2025-12-16T15:30:00",
+                "status": "generated_new"
+            }
+        }
 
-    # 3. Сохраняем в Redis
-    save_summary_to_redis(ticket_id, structured_data)
+# --- ЛОГИКА ---
 
+def check_auth(creds: HTTPBasicCredentials = Depends(security)):
+    if not (secrets.compare_digest(creds.username, API_USER) and 
+            secrets.compare_digest(creds.password, API_PASS)):
+        raise HTTPException(status_code=401, detail="Auth Error")
+    return creds.username
+
+def get_zendesk_data(ticket_id: str):
+    """
+    ВАЖНОЕ ИСПРАВЛЕНИЕ: Делаем 2 отдельных запроса.
+    1. Тикет + Юзеры (для имени агента)
+    2. Аудиты (для диалога)
+    """
+    print(f"📡 ZENDESK: Качаем метаданные тикета {ticket_id}...")
+    
+    # Запрос 1: Метаданные
+    url_ticket = f"{ZD_URL}/api/v2/tickets/{ticket_id}.json?include=users"
+    try:
+        resp_ticket = requests.get(url_ticket, auth=ZD_AUTH, timeout=10)
+        if resp_ticket.status_code == 404:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        if resp_ticket.status_code != 200:
+            print(f"❌ Ошибка Ticket API: {resp_ticket.text}")
+            raise HTTPException(status_code=500, detail="Zendesk API Error")
+        ticket_data = resp_ticket.json()
+    except Exception as e:
+        print(f"❌ Сетевая ошибка (Ticket): {e}")
+        raise HTTPException(status_code=500, detail="Network Error")
+
+    # Запрос 2: История (Аудиты) - отдельно, чтобы не обрезалось!
+    print(f"📡 ZENDESK: Качаем полную историю (audits)...")
+    url_audits = f"{ZD_URL}/api/v2/tickets/{ticket_id}/audits.json"
+    try:
+        resp_audits = requests.get(url_audits, auth=ZD_AUTH, timeout=15)
+        if resp_audits.status_code != 200:
+            print(f"⚠️ Ошибка Audits API: {resp_audits.text}. Диалог будет пуст.")
+            audits_list = []
+        else:
+            audits_list = resp_audits.json().get("audits", [])
+    except Exception as e:
+        print(f"⚠️ Сетевая ошибка (Audits): {e}")
+        audits_list = []
+
+    # Склеиваем результат
     return {
-        "ticket_id": ticket_id,
-        "structured_summary": structured_data,
-        "status": "generated_new"
+        "ticket": ticket_data.get("ticket", {}),
+        "users": ticket_data.get("users", []),
+        "audits": audits_list
     }
 
-# НОВАЯ РУЧКА ДЛЯ ВЫГРУЗКИ (SCAN)
-@app.get("/history")
-def get_all_redis_history(username: str = Depends(check_auth)):
-    """
-    Сканирует весь Redis в поиске ключей 'ticket:*'
-    и собирает их значения.
-    """
-    all_data = []
-    # scan_iter - безопасный способ перебрать ключи, не вешая сервер
-    for key in r.scan_iter("ticket:*"):
-        val_json = r.get(key)
-        if val_json:
-            data = json.loads(val_json)
-            # Добавим сам ID тикета внутрь для удобства чтения
-            data["ticket_id_key"] = key 
-            all_data.append(data)
+def parse_ticket_data(data: dict) -> tuple[str, str, int | str | None]:
+    """Разбирает JSON: находит диалог и агента"""
+    print("🔍 PARSER: Начинаем разбор...")
+    ticket = data.get("ticket", {})
+    users = data.get("users", [])
+    audits = data.get("audits", [])
+    
+    # 1. Ищем ID Агента
+    assignee = ticket.get("assignee") or ticket.get("assignee_id")
+    
+    # Если в шапке нет, ищем в истории (последнее назначение)
+    if not assignee:
+        for audit in reversed(audits):
+            if audit.get("assignee"): assignee = audit.get("assignee"); break
+            if audit.get("assignee_id"): assignee = audit.get("assignee_id"); break
+            for ev in audit.get("events", []):
+                if ev.get("field_name") in ["assignee", "assignee_id"] and ev.get("value"):
+                    assignee = ev.get("value"); break
+            if assignee: break
             
-    return {"count": len(all_data), "data": all_data}
+    # 2. Ищем Имя Агента
+    agent_name = "Unknown Agent"
+    if assignee:
+        try:
+            target_id = int(assignee)
+            for u in users:
+                if u["id"] == target_id:
+                    agent_name = u["name"]
+                    break
+        except: pass 
+        
+    print(f"🔍 PARSER: Агент: {agent_name} (ID: {assignee})")
+    print(f"🔍 PARSER: Всего блоков аудита доступно: {len(audits)}")
+
+    # 3. Собираем Диалог (Улучшенная логика)
+    messages = []
+    user_map = {u["id"]: u["name"] for u in users}
+    IGNORE = ["Mutaxassisni chaqirish", "Main Menu", "Start Chat", "Bot started"]
+
+    for audit in audits:
+        for ev in audit.get("events", []):
+            event_type = ev.get("type")
+            
+            # Тип А: Чаты (Messaging)
+            if event_type == "ChatStartedEvent":
+                history = ev.get("value", {}).get("history", [])
+                if not history and "history" in ev: 
+                    history = ev["history"]
+                
+                for h in history:
+                    if h.get("type") != "ChatMessage": continue
+                    msg = h.get("message", "")
+                    if msg is None: msg = ""
+                    msg = str(msg).strip()
+                    
+                    if not msg or any(x in msg for x in IGNORE): continue
+                    
+                    role = h.get("actor_type") # end-user / agent
+                    d_name = h.get("name") or h.get("actor_name") or "User"
+                    
+                    if h.get("author_id") and h.get("author_id") in user_map:
+                        d_name = user_map[h.get("author_id")]
+
+                    prefix = f"CLIENT ({d_name})" if role == "end-user" else f"AGENT ({d_name})"
+                    messages.append(f"{prefix}: {msg}")
+            
+            # Тип Б: Почта/Комменты
+            elif event_type == "Comment":
+                is_public = ev.get("public", False)
+                if is_public:
+                    body = ev.get("plain_body") or ev.get("body")
+                    if body:
+                        author_id = ev.get("author_id")
+                        author_name = user_map.get(author_id, "AGENT")
+                        messages.append(f"{author_name}: {body}")
+
+    dialogue = "\n".join(messages)
+    print(f"📝 PARSER: Итого сообщений в диалоге: {len(messages)}")
+    return dialogue, agent_name, assignee
+
+# --- ФУНКЦИИ ИИ (РАЗДЕЛЕННЫЕ) ---
+
+def run_summary_ai(ticket_id: str, dialogue: str) -> dict:
+    print("🤖 AI (Summary): Отправка...")
+    prompt = f"""
+    Ты — помощник оператора. Сделай краткое саммари тикета.
+    ВАЖНО: ОТВЕЧАЙ СТРОГО НА РУССКОМ ЯЗЫКЕ.
+    Диалог:
+    {dialogue}
+    JSON (на русском):
+    - issue: Суть проблемы (1 предл)
+    - action: Что сделал оператор (1 предл)
+    - result: Итог (1 предл)
+    """
+    try:
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL_SUMMARY,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=TicketSummary)
+        )
+        return json.loads(resp.text)
+    except Exception as e:
+        print(f"❌ AI ERROR: {e}")
+        return {"ticket_id": ticket_id, "issue": "Error", "action": "-", "result": str(e)}
+
+def run_evaluation_ai(ticket_id: str, dialogue: str) -> dict:
+    print("🤖 AI (QA): Отправка...")
+    prompt = f"""
+    Ты — QA аналитик. Оцени качество диалога.
+    ВАЖНО: ОТВЕЧАЙ СТРОГО НА РУССКОМ ЯЗЫКЕ.
+    Диалог: {dialogue}
+    JSON (на русском):
+    - language (ru/uz/en)
+    - tov_score (0-5)
+    - solution_score (0-5)
+    - errors (список)
+    - next_action (совет)
+    """
+    try:
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL_QA,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=TicketEvaluation)
+        )
+        res = json.loads(resp.text)
+        res["analyzed_at"] = str(datetime.now())
+        return res
+    except Exception as e:
+        print(f"❌ AI ERROR: {e}")
+        return {
+            "ticket_id": ticket_id, "language": "err", "tov_score": 0, "solution_score": 0,
+            "errors": [str(e)], "next_action": "-", "analyzed_at": str(datetime.now())
+        }
+
+# --- РУЧКИ ---
+
+@app.post("/summary", response_model=TicketSummary)
+def get_summary(req: TicketRequest, user: str = Depends(check_auth)):
+    tid = req.ticket_id
+    if r:
+        cached = r.get(f"summary:{tid}")
+        if cached: return {**json.loads(cached), "status": "from_cache"}
+
+    data = get_zendesk_data(tid)
+    dialogue, agent, aid = parse_ticket_data(data)
+    
+    if not dialogue:
+        res = {"ticket_id": tid, "assignee_id": aid, "agent_name": agent, "issue": "Нет диалога", "action": "-", "result": "-", "status": "empty"}
+        # Не кешируем ошибку надолго, если проблема была сетевой
+        return res
+
+    result = run_summary_ai(tid, dialogue)
+    result.update({"ticket_id": tid, "assignee_id": aid, "agent_name": agent, "status": "generated_new"})
+    if r: r.set(f"summary:{tid}", json.dumps(result))
+    return result
+
+@app.post("/evaluate", response_model=TicketEvaluation)
+def evaluate_ticket(req: TicketRequest, user: str = Depends(check_auth)):
+    tid = req.ticket_id
+    if r:
+        cached = r.get(f"qa:{tid}")
+        if cached: return {**json.loads(cached), "status": "from_cache"}
+
+    data = get_zendesk_data(tid)
+    dialogue, agent, aid = parse_ticket_data(data)
+
+    if not dialogue:
+        res = {"ticket_id": tid, "assignee_id": aid, "agent_name": agent, "language": "n/a", "tov_score": 0, "solution_score": 0, "errors": ["Empty"], "next_action": "-", "status": "empty"}
+        return res
+
+    result = run_evaluation_ai(tid, dialogue)
+    result.update({"ticket_id": tid, "assignee_id": aid, "agent_name": agent, "status": "generated_new"})
+    if r: r.set(f"qa:{tid}", json.dumps(result))
+    return result
+
+@app.get("/analytics/errors")
+def get_errors(user: str = Depends(check_auth)):
+    if not r: return {"error": "No Redis"}
+    rows = []
+    for k in r.scan_iter("qa:*"):
+        val = r.get(k)
+        if val:
+            d = json.loads(val)
+            if d.get("tov_score", 5) < 4 or d.get("solution_score", 5) < 4 or d.get("errors"):
+                rows.append(d)
+    return {"count": len(rows), "data": rows}

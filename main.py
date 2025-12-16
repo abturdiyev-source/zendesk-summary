@@ -128,6 +128,18 @@ class TicketEvaluation(BaseModel):
 
 # --- ЛОГИКА ---
 
+# --- ЗАГРУЗКА TOV (Новая логика) ---
+def load_tov_rules():
+    """Читает файл с правилами, если он есть"""
+    try:
+        with open("tov_rules.md", "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        print("⚠️ Внимание: Файл tov_rules.md не найден! Используем общие правила.")
+        return "Правила не заданы. Оценивай на основе здравого смысла и вежливости."
+
+TOV_RULES = load_tov_rules() # Загружаем 1 раз при старте сервера
+
 def check_auth(creds: HTTPBasicCredentials = Depends(security)):
     if not (secrets.compare_digest(creds.username, API_USER) and 
             secrets.compare_digest(creds.password, API_PASS)):
@@ -258,6 +270,52 @@ def parse_ticket_data(data: dict) -> tuple[str, str, int | str | None]:
     return dialogue, agent_name, assignee
 
 # --- ФУНКЦИИ ИИ (РАЗДЕЛЕННЫЕ) ---
+
+# --- ОБНОВЛЕННАЯ ФУНКЦИЯ ОЦЕНКИ ---
+def run_evaluation_ai(ticket_id: str, dialogue: str) -> dict:
+    print("🤖 AI (QA): Отправка запроса с ToV...")
+    
+    # Вставляем правила (TOV_RULES) прямо в промпт
+    prompt = f"""
+    Ты — строгий QA аналитик поддержки. Твоя цель — проверить соответствие диалога регламенту.
+    
+    === РЕГЛАМЕНТ КОМПАНИИ (ToV) ===
+    {TOV_RULES}
+    ================================
+    
+    ВАЖНО:
+    1. Оценивай СТРОГО по тексту регламента выше.
+    2. Если агент нарушил конкретный пункт из регламента, укажи это в errors.
+    3. Отвечай на РУССКОМ языке.
+    
+    === ДИАЛОГ ДЛЯ ПРОВЕРКИ ===
+    {dialogue}
+    ===========================
+    
+    Выведи JSON:
+    - language (ru/uz/en)
+    - tov_score (0-5, где 5 - полное соблюдение регламента)
+    - solution_score (0-5)
+    - errors (список нарушений со ссылкой на пункты регламента)
+    - next_action (совет агенту)
+    """
+    
+    try:
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL_QA,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=TicketEvaluation)
+        )
+        res = json.loads(resp.text)
+        res["analyzed_at"] = str(datetime.now())
+        return res
+    except Exception as e:
+        print(f"❌ AI ERROR: {e}")
+        return {
+            "ticket_id": ticket_id, "language": "err", "tov_score": 0, "solution_score": 0,
+            "errors": [str(e)], "next_action": "-", "analyzed_at": str(datetime.now())
+        }
+
 
 def run_summary_ai(ticket_id: str, dialogue: str) -> dict:
     print("🤖 AI (Summary): Отправка...")

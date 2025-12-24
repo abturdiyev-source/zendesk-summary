@@ -9,8 +9,7 @@ import json
 import redis
 from datetime import datetime
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 # 1. Загружаем настройки
 load_dotenv()
@@ -30,7 +29,7 @@ app.add_middleware(
 security = HTTPBasic()
 
 # --- ПРОВЕРКА ENV ---
-REQUIRED_VARS = ["ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN", "GEMINI_API_KEY"]
+REQUIRED_VARS = ["ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN", "OPENAI_API_KEY"]
 missing = [v for v in REQUIRED_VARS if not os.getenv(v)]
 if missing:
     print(f"⚠️  FATAL: В .env не хватает ключей: {', '.join(missing)}")
@@ -43,9 +42,8 @@ ZD_URL = f"https://{os.getenv('ZENDESK_SUBDOMAIN')}.zendesk.com"
 ZD_AUTH = (f"{os.getenv('ZENDESK_EMAIL')}/token", os.getenv('ZENDESK_API_TOKEN'))
 
 # ИИ
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-GEMINI_MODEL_SUMMARY = "gemini-2.0-flash" # Быстрая для саммари
-GEMINI_MODEL_QA = "gemini-2.5-flash"      # Умная для оценки
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+MODEL_GPT4O = "gpt-4o"
 
 # Redis
 REDIS_URL = os.getenv("REDIS_URL")
@@ -301,16 +299,19 @@ def run_evaluation_ai(ticket_id: str, dialogue: str) -> dict:
     """
     
     try:
-        resp = gemini_client.models.generate_content(
-            model=GEMINI_MODEL_QA,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=TicketEvaluation)
+        completion = client.beta.chat.completions.parse(
+            model=MODEL_GPT4O,
+            messages=[
+                {"role": "system", "content": "Ты — строгий QA аналитик поддержки. Твоя цель — проверить соответствие диалога регламенту."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format=TicketEvaluation,
         )
-        res = json.loads(resp.text)
+        res = completion.choices[0].message.parsed.model_dump()
         res["analyzed_at"] = str(datetime.now())
         return res
     except Exception as e:
-        print(f"❌ AI ERROR: {e}")
+        print(f"❌ AI ERROR: {e}")  
         return {
             "ticket_id": ticket_id, "language": "err", "tov_score": 0, "solution_score": 0,
             "errors": [str(e)], "next_action": "-", "analyzed_at": str(datetime.now())
@@ -330,12 +331,15 @@ def run_summary_ai(ticket_id: str, dialogue: str) -> dict:
     - result: Итог (1 предл)
     """
     try:
-        resp = gemini_client.models.generate_content(
-            model=GEMINI_MODEL_SUMMARY,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=TicketSummary)
+        completion = client.beta.chat.completions.parse(
+            model=MODEL_GPT4O,
+            messages=[
+                {"role": "system", "content": "Ты — помощник оператора. Сделай краткое саммари тикета."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format=TicketSummary,
         )
-        return json.loads(resp.text)
+        return completion.choices[0].message.parsed.model_dump()
     except Exception as e:
         print(f"❌ AI ERROR: {e}")
         return {"ticket_id": ticket_id, "issue": "Error", "action": "-", "result": str(e)}
@@ -354,12 +358,15 @@ def run_evaluation_ai(ticket_id: str, dialogue: str) -> dict:
     - next_action (совет)
     """
     try:
-        resp = gemini_client.models.generate_content(
-            model=GEMINI_MODEL_QA,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=TicketEvaluation)
+        completion = client.beta.chat.completions.parse(
+            model=MODEL_GPT4O,
+            messages=[
+                {"role": "system", "content": "Ты — QA аналитик. Оцени качество диалога."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format=TicketEvaluation,
         )
-        res = json.loads(resp.text)
+        res = completion.choices[0].message.parsed.model_dump()
         res["analyzed_at"] = str(datetime.now())
         return res
     except Exception as e:
@@ -421,3 +428,21 @@ def get_errors(user: str = Depends(check_auth)):
             if d.get("tov_score", 5) < 4 or d.get("solution_score", 5) < 4 or d.get("errors"):
                 rows.append(d)
     return {"count": len(rows), "data": rows}
+
+@app.get("/health")
+def health_check():
+    """Публичный эндпоинт для мониторинга (UptimeRobot, Better Stack и др.)"""
+    redis_status = "unknown"
+    
+    if r is None:
+        redis_status = "unknown"  # Redis не настроен
+    else:
+        try:
+            r.ping()
+            redis_status = "connected"
+        except Exception:
+            redis_status = "disconnected"
+    
+    status = "healthy" if redis_status != "disconnected" else "unhealthy"
+    
+    return {"status": status, "redis": redis_status}
